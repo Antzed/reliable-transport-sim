@@ -6,6 +6,7 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Condition, Event
 import time
+import hashlib
 
 
 class Streamer:
@@ -28,7 +29,6 @@ class Streamer:
         self.buffer = {}  # Buffer for out-of-order packets (key: sequence_num, value: data)
         
         self.buffer_lock = Lock()  # Lock for thread-safe buffer access
-        self.expected_seq_lock = Lock()
         self.closed = False  # Flag to control listener thread
 
         self.ack_received = Condition() # waif for acks
@@ -36,9 +36,6 @@ class Streamer:
 
         # FIN handshake state
         self.fin_received = Event()
-
-        # Thread-safe Structure
-        self.buffer_lock = Lock()
 
         # Start background listener thread
         self.executor = ThreadPoolExecutor(max_workers=1)
@@ -49,48 +46,62 @@ class Streamer:
         while not self.closed:
             try:
                 packet, addr = self.socket.recvfrom()
-                # changed from 4 to 5 to accommodate the package type: is it data or ack
-                if len(packet) < 5:
+                # changed from 5 to 21 to accommodate newly added hash
+                if len(packet) < 21: # 1 + 4 + 16 = 21 bytes header
                     continue
                 ptype = packet[0]
                 sequence_num = struct.unpack('!I', packet[1:5])[0]
+                received_hash = packet[5:21]
+                data = packet[21:]
 
+                # Compute hash based on ptype
+                computed_hash = hashlib.md5(data).digest() if ptype == self.DATA_TYPE else hashlib.md5(b'').digest()
+                
+                    
+                # computed_hash = hashlib.md5(data).digest()
+                if received_hash != computed_hash:
+                    print(f"Corrupted packet (seq {sequence_num}, type {ptype}) discarded")
+                    continue
+                
                 if ptype == self.DATA_TYPE:
-                    data = packet[5:]
                     with self.buffer_lock:
                         if sequence_num >= self.expected_sequence_num:
                             self.buffer[sequence_num] = data
                         #send ack
-                    ack_packet = bytes([self.ACK_TYPE]) + struct.pack('!I', sequence_num)
+                    ack_hash = hashlib.md5(b'').digest()
+                    ack_packet = bytes([self.ACK_TYPE]) + struct.pack('!I', sequence_num) + ack_hash
                     self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
                 elif ptype == self.ACK_TYPE:
                     with self.ack_received:
-                        if sequence_num > self.last_acked:
+                        if sequence_num == self.last_acked + 1:
                             self.last_acked = sequence_num
                             self.ack_received.notify_all()
                 elif ptype == self.FIN_TYPE:
-                    ack_packet = bytes([self.ACK_TYPE]) + struct.pack('!I', sequence_num)
+                    ack_hash = hashlib.md5(b'').digest()
+                    ack_packet = bytes([self.ACK_TYPE]) + struct.pack('!I', sequence_num) + ack_hash
                     self.socket.sendto(ack_packet, addr)
                     self.fin_received.set()
             except Exception as e:
                 if not self.closed:
                     print(f"Listener error: {e}")
-                break
 
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
-        max_chunk_size = 1472 - 5  # Reserve 5 bytes for packet type bit and the sequence number
+        max_chunk_size = 1472 - 21  # Reserve 5 bytes for packet type bit and the sequence number
         for offset in range(0, len(data_bytes), max_chunk_size):
             chunk = data_bytes[offset:offset + max_chunk_size]
             current_sequence = self.sequence_num
+
+            #compute hash of data
+            chunk_hash = hashlib.md5(chunk).digest()
             # Prepend sequence number to the chunk
-            header = bytes([self.DATA_TYPE]) + struct.pack('!I', current_sequence)
+            header = bytes([self.DATA_TYPE]) + struct.pack('!I', current_sequence) + chunk_hash
             packet = header + chunk
             while True:
                 self.socket.sendto(packet, (self.dst_ip, self.dst_port))
                 with self.ack_received:
-                    if self.last_acked >= current_sequence:
+                    if self.last_acked == current_sequence:
                         break
                     if not self.ack_received.wait(timeout=0.25):
                         print(f"seq {current_sequence} timeout, retransmitting...")
@@ -99,7 +110,7 @@ class Streamer:
 
     def recv(self) -> bytes:
         while True:
-            with self.expected_seq_lock, self.buffer_lock:
+            with self.buffer_lock:
                 if self.expected_sequence_num in self.buffer:
                     data = self.buffer.pop(self.expected_sequence_num)
                     self.expected_sequence_num += 1
@@ -117,7 +128,8 @@ class Streamer:
            the necessary ACKs and retransmissions"""
         # Send FIN packet and wait for ACK
         fin_seq = self.sequence_num
-        fin_packet = bytes([self.FIN_TYPE]) + struct.pack('!I', fin_seq)
+        fin_hash = hashlib.md5(b'').digest()
+        fin_packet = bytes([self.FIN_TYPE]) + struct.pack('!I', fin_seq) + fin_hash
 
         # retransmission until ACK received
         while True:
